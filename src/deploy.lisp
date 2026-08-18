@@ -1,0 +1,227 @@
+;;;; src/deploy.lisp -- find-dapla-deploy/deploy core package
+;;;;
+;;;; Consfigurator properties and DEFHOST for SearXNG at find.dapla.net.
+;;;; SearXNG is a privacy-respecting metasearch engine. It requires no
+;;;; database; state is limited to the settings volume.
+
+(defpackage :find-dapla-deploy/deploy
+  (:use :cl)
+  (:import-from :consfigurator
+                :defprop :defhost :mrun :stripln
+                :remote-exists-p :write-remote-file :on-change)
+  (:import-from :consfigurator.property.file
+                :has-content :containing-directory-exists)
+  (:import-from :consfigurator.property.systemd :lingering-enabled)
+  (:import-from :consfigurator.property.service :reloaded)
+  (:export :*service-user* :*home-dataset* :*home-mountpoint*
+           :*settings-dataset* :*settings-mountpoint*
+           :*home-dataset-keyfile* :*settings-dataset-keyfile*
+           :*haproxy-fqdn*
+           :deploy-app
+           :zfs-encryption-key :zfs-dataset-mounted
+           :rootless-service-account
+           :images-pulled :quadlets-activated
+           :cinix-write-string
+           :searxng-network-sections
+           :searxng-container-sections
+           :haproxy-vhost-config))
+
+(in-package :find-dapla-deploy/deploy)
+
+(defparameter *service-user* "searxng"
+  "Rootless system account the quadlet runs under.")
+(defparameter *home-dataset* "storage/users/searxng")
+(defparameter *home-mountpoint* "/var/lib/searxng")
+(defparameter *home-dataset-keyfile* "/etc/zfs-keys/searxng-users.key")
+(defparameter *settings-dataset* "storage/containers/searxng")
+(defparameter *settings-mountpoint* "/srv/searxng"
+  "SearXNG settings.yml and uwsgi.ini volume.")
+(defparameter *settings-dataset-keyfile* "/etc/zfs-keys/searxng-settings.key")
+(defparameter *haproxy-fqdn* "find.dapla.net")
+(defparameter *haproxy-vhost-name* "find")
+
+(defprop zfs-encryption-key :posix (path)
+  "Generate a raw 32-byte ZFS encryption key at PATH via `openssl rand`,
+   once, left alone on redeploy."
+  (:desc (format nil "ZFS encryption key at ~A" path))
+  (:check (remote-exists-p path))
+  (:apply
+   (containing-directory-exists path)
+   (let ((key (stripln (mrun "openssl" "rand" "-hex" "32"))))
+     (write-remote-file path key :mode #o600))))
+
+(defun zfs-create-command (dataset mountpoint keyfile)
+  "The `zfs create` command for DATASET at MOUNTPOINT, AES-256-GCM
+   encrypted when KEYFILE is supplied."
+  (if keyfile
+      (format nil "zfs create -o mountpoint=~A -o encryption=aes-256-gcm -o keyformat=raw -o keylocation=file://~A ~A"
+              mountpoint keyfile dataset)
+      (format nil "zfs create -o mountpoint=~A ~A" mountpoint dataset)))
+
+(defprop zfs-dataset-mounted :posix (dataset mountpoint &optional keyfile)
+  "Ensure DATASET exists, mounted at MOUNTPOINT, AES-256-GCM encrypted
+   when KEYFILE is supplied."
+  (:desc (format nil "ZFS dataset ~A mounted at ~A~:[~; (encrypted)~]"
+                  dataset mountpoint keyfile))
+  (:check
+   (multiple-value-bind (out err exit)
+       (consfigurator:run :may-fail
+         (format nil "zfs get -H -o value mounted ~A" dataset))
+     (declare (ignore err))
+     (and (zerop exit) (string= "yes" (stripln out)))))
+  (:apply
+   (if (zerop (mrun :for-exit (format nil "zfs list -H -o name ~A" dataset)))
+       (progn
+         (when keyfile (mrun (format nil "zfs load-key ~A" dataset)))
+         (mrun (format nil "zfs mount ~A" dataset)))
+       (mrun (zfs-create-command dataset mountpoint keyfile)))))
+
+(defprop rootless-service-account :posix (username home)
+  "Ensure system account USERNAME exists with home HOME, without creating
+   the directory (ZFS-backed, provisioned by ZFS-DATASET-MOUNTED)."
+  (:desc (format nil "System account ~A at ~A" username home))
+  (:check (zerop (mrun :for-exit "id" username)))
+  (:apply (mrun "useradd" "--system" "--no-create-home"
+                "--home-dir" home username)))
+
+(defprop images-pulled :posix (user &rest images)
+  "Pull IMAGES into USER's rootless Podman image store via `machinectl shell`."
+  (:desc (format nil "Podman images pulled for ~A" user))
+  (:check
+   (every (lambda (image)
+            (zerop (mrun :for-exit
+                    (format nil "machinectl shell ~A@ -- podman image exists ~A"
+                            user image))))
+          images))
+  (:apply
+   (dolist (image images)
+     (mrun (format nil "machinectl shell ~A@ -- podman pull ~A" user image)))))
+
+(defun cinix-write-string (sections)
+  "Serialize an alist of (section-name . ((key . value) ...)) into
+   INI/systemd unit-file text."
+  (with-output-to-string (s)
+    (dolist (section sections)
+      (format s "[~A]~%" (car section))
+      (dolist (kv (cdr section))
+        (format s "~A=~A~%" (car kv) (cdr kv)))
+      (format s "~%"))))
+
+(defun service-account-uid (username)
+  "Read USERNAME's UID from the local passwd database via getent, at
+   property apply time after ROOTLESS-SERVICE-ACCOUNT has run. The UID
+   is used as the loopback PublishPort, per dapla.net convention."
+  (parse-integer
+   (third
+    (uiop:split-string
+     (string-trim '(#\Newline #\Space)
+       (with-output-to-string (s)
+         (uiop:run-program (list "getent" "passwd" username) :output s)))
+     :separator '(#\:)))))
+
+(defun searxng-network-sections ()
+  "Cinix AST for searxng.network: internal-only network."
+  '(("Network" . (("NetworkName" . "searxng")
+                  ("Internal"    . "true")))))
+
+(defun searxng-container-sections (settings-mountpoint)
+  "Cinix AST for searxng.container. SearXNG has no database dependency;
+   the settings volume holds settings.yml and uwsgi.ini. The loopback
+   port is the service account UID, per dapla.net convention."
+  (let ((port (service-account-uid *service-user*)))
+    `(("Unit" . (("Description" . "SearXNG metasearch engine")
+                 ("After"       . "network-online.target")
+                 ("Wants"       . "network-online.target")))
+      ("Container" . (("Image"         . "oci.dapla.net/searxng/searxng:latest")
+                      ("ContainerName" . "searxng")
+                      ("AutoUpdate"    . "registry")
+                      ("PublishPort"   . ,(format nil "127.0.0.1:~A:8080" port))
+                      ("Volume"        . ,(format nil "~A:/etc/searxng:Z"
+                                                  settings-mountpoint))
+                      ("Environment"   . "SEARXNG_BASE_URL=https://find.dapla.net/")
+                      ("Network"       . "searxng.network")
+                      ("Label"         . "io.containers.autoupdate=registry")))
+      ("Service" . (("Restart"         . "on-failure")
+                    ("TimeoutStartSec" . "60")
+                    ("TimeoutStopSec"  . "30")))
+      ("Install" . (("WantedBy" . "default.target"))))))
+
+(defun haproxy-vhost-config ()
+  "HAProxy vhost text for find.dapla.net. Backend port is the service
+   account UID, per dapla.net convention."
+  (let ((port (service-account-uid *service-user*)))
+    (format nil
+"frontend ~A_http
+  bind *:80
+  acl host_~A hdr(host) -i ~A
+  redirect scheme https code 301 if host_~A
+
+frontend ~A_https
+  bind *:443 ssl crt /etc/haproxy/certs/~A.pem alpn h2,http/1.1
+  acl host_~A hdr(host) -i ~A
+  http-response set-header Strict-Transport-Security \"max-age=63072000; includeSubDomains; preload\"
+  http-response set-header X-Content-Type-Options nosniff
+  http-response set-header X-Frame-Options SAMEORIGIN
+  http-response set-header Referrer-Policy strict-origin-when-cross-origin
+  http-response set-header Permissions-Policy \"interest-cohort=()\"
+  use_backend ~A_be if host_~A
+
+backend ~A_be
+  balance roundrobin
+  option httpchk GET /healthz
+  http-check expect status 200
+  timeout connect 5s
+  timeout server  30s
+  server searxng 127.0.0.1:~A check inter 10s rise 2 fall 3
+"
+            *haproxy-vhost-name* *haproxy-vhost-name* *haproxy-fqdn* *haproxy-vhost-name*
+            *haproxy-vhost-name* *haproxy-fqdn*
+            *haproxy-vhost-name* *haproxy-fqdn*
+            *haproxy-vhost-name* *haproxy-vhost-name*
+            *haproxy-vhost-name*
+            port)))
+
+(defprop quadlets-activated :posix (user)
+  "Reload USER's user-scope systemd daemon and restart searxng."
+  (:desc (format nil "Quadlets activated for ~A" user))
+  (:apply
+   (mrun (format nil "machinectl shell ~A@ -- systemctl --user daemon-reload" user))
+   (mrun (format nil "machinectl shell ~A@ -- systemctl --user restart searxng"
+                 user))))
+
+(defhost searxng-host (:deploy (:local))
+  "The SearXNG host: two AES-256-GCM ZFS datasets, rootless service
+   account, linger, pulled image, one quadlet unit, and HAProxy vhost."
+  (zfs-encryption-key *home-dataset-keyfile*)
+  (zfs-encryption-key *settings-dataset-keyfile*)
+  (zfs-dataset-mounted *home-dataset*     *home-mountpoint*     *home-dataset-keyfile*)
+  (zfs-dataset-mounted *settings-dataset* *settings-mountpoint* *settings-dataset-keyfile*)
+  (rootless-service-account *service-user* *home-mountpoint*)
+  (lingering-enabled *service-user*)
+  (images-pulled *service-user* "oci.dapla.net/searxng/searxng:latest")
+  (has-content
+   (format nil "~A/.config/containers/systemd/searxng.network" *home-mountpoint*)
+   (cinix-write-string (searxng-network-sections)))
+  (has-content
+   (format nil "~A/.config/containers/systemd/searxng.container" *home-mountpoint*)
+   (cinix-write-string (searxng-container-sections *settings-mountpoint*)))
+  (quadlets-activated *service-user*)
+  (on-change
+      (has-content
+       (format nil "/etc/haproxy/conf.d/~A.cfg" *haproxy-vhost-name*)
+       (haproxy-vhost-config))
+    (reloaded "haproxy")))
+
+(defun deploy-app ()
+  "Provision the SearXNG stack via SEARXNG-HOST (Consfigurator, :local
+   connection). Aborts loudly if any property is skipped."
+  (format t "~&--> Provisioning via Consfigurator (SEARXNG-HOST)...~%")
+  (let ((provisioning-failed nil))
+    (handler-bind ((consfigurator::skipped-properties
+                     (lambda (c) (declare (ignore c))
+                       (setf provisioning-failed t))))
+      (searxng-host))
+    (when provisioning-failed
+      (error "SEARXNG-HOST provisioning reported failed properties ~
+              (see the per-property report above). Refusing to proceed.")))
+  (format t "~&--> SearXNG provisioned. Visit https://~A~%" *haproxy-fqdn*))
