@@ -50,7 +50,7 @@
   (:check (remote-exists-p path))
   (:apply
    (containing-directory-exists path)
-   (let ((key (stripln (mrun "openssl" "rand" "-hex" "32"))))
+   (let ((key (mrun "openssl" "rand" "32")))
      (write-remote-file path key :mode #o600))))
 
 (defun zfs-create-command (dataset mountpoint keyfile)
@@ -93,12 +93,12 @@
   (:check
    (every (lambda (image)
             (zerop (mrun :for-exit
-                    (format nil "machinectl shell ~A@ -- podman image exists ~A"
+                    (format nil "machinectl shell ~A@ /usr/bin/podman image exists ~A"
                             user image))))
           images))
   (:apply
    (dolist (image images)
-     (mrun (format nil "machinectl shell ~A@ -- podman pull ~A" user image)))))
+     (mrun (format nil "machinectl shell ~A@ /usr/bin/podman pull ~A" user image)))))
 
 (defun cinix-write-string (sections)
   "Serialize an alist of (section-name . ((key . value) ...)) into
@@ -193,8 +193,8 @@ backend ~A_be
   "Reload USER's user-scope systemd daemon and restart searxng."
   (:desc (format nil "Quadlets activated for ~A" user))
   (:apply
-   (mrun (format nil "machinectl shell ~A@ -- systemctl --user daemon-reload" user))
-   (mrun (format nil "machinectl shell ~A@ -- systemctl --user restart searxng"
+   (mrun (format nil "machinectl shell ~A@ /usr/bin/systemctl --user daemon-reload" user))
+   (mrun (format nil "machinectl shell ~A@ /usr/bin/systemctl --user restart searxng"
                  user))))
 
 
@@ -232,6 +232,7 @@ backend ~A_be
             (current (when (probe-file cfg-path)
                        (uiop:read-file-string cfg-path))))
        (unless (equal new-content current)
+         (containing-directory-exists cfg-path)
          (write-remote-file cfg-path new-content)
          (consfigurator.property.service:reloaded "haproxy"))))))
 
