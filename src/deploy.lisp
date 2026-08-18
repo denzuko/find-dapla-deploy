@@ -122,8 +122,7 @@
   "Cinix AST for searxng.container. SearXNG has no database dependency;
    the settings volume holds settings.yml and uwsgi.ini. The loopback
    port is the service account UID, per dapla.net convention."
-  (let ((port (+ (service-account-uid *service-user*) *port-base*)))
-    `(("Unit" . (("Description" . "SearXNG metasearch engine")
+  `(("Unit" . (("Description" . "SearXNG metasearch engine")
                  ("After"       . "network-online.target")
                  ("Wants"       . "network-online.target")))
       ("Container" . (("Image"         . "oci.dapla.net/searxng/searxng:latest")
@@ -146,8 +145,7 @@
 (defun haproxy-vhost-config ()
   "HAProxy vhost text for find.dapla.net. Backend port is the service
    account UID, per dapla.net convention."
-  (let ((port (+ (service-account-uid *service-user*) *port-base*)))
-    (format nil
+  (format nil
 "frontend ~A_http
   bind *:80
   acl host_~A hdr(host) -i ~A
@@ -211,12 +209,7 @@ backend ~A_be
   (:desc (format nil "HAProxy vhost written for ~A" *haproxy-fqdn*))
   (:check nil)
   (:apply
-   (let ((port (+ (service-account-uid *service-user*) *port-base*)))
-     (unless port
-       (consfigurator:inapplicable-property
-        "Service account ~A does not exist; cannot determine port."
-        *service-user*))
-     (let* ((cfg-path (format nil "/etc/haproxy/conf.d/~A.cfg" *haproxy-vhost-name*))
+   (let* ((cfg-path (format nil "/etc/haproxy/conf.d/~A.cfg" *haproxy-vhost-name*))
             (new-content (haproxy-vhost-config))
             (current (when (probe-file cfg-path)
                        (uiop:read-file-string cfg-path))))
