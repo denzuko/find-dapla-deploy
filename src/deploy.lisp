@@ -253,10 +253,10 @@ backend ~A_be
    (mrun "loginctl" "terminate-user" user)
    (mrun "loginctl" "disable-linger" user)
    (mrun "userdel" user)
-   (mrun "zfs" "destroy" "-r" 'storage/users/searxng')
-   (mrun "zfs" "destroy" "-r" 'storage/containers/searxng')
-   (mrun "rm" "-f" '/etc/zfs-keys/searxng-users.key')
-   (mrun "rm" "-f" '/etc/zfs-keys/searxng-settings.key')))
+   (mrun "zfs" "destroy" "-r" "storage/users/searxng")
+   (mrun "zfs" "destroy" "-r" "storage/containers/searxng")
+   (mrun "rm" "-f" "/etc/zfs-keys/searxng-users.key")
+   (mrun "rm" "-f" "/etc/zfs-keys/searxng-settings.key")))
 
 (defun deploy-app ()
   "Provision the SearXNG stack via SEARXNG-HOST (Consfigurator, :local
