@@ -30,6 +30,8 @@
            :zfs-encryption-key :zfs-dataset-mounted
            :rootless-service-account :images-pulled
            :cinix-write-string
+           :searxng-network-sections
+           :searxng-container-sections
            :quadlets-written :quadlets-activated
            :haproxy-vhost-config :haproxy-vhost-written
            :decommissioned))
@@ -117,14 +119,15 @@
                    ("Subnet"      . "10.89.2.0/30")
                    ("Gateway"     . "10.89.2.1")))))
 
-(defun searxng-container-sections (data-mountpoint)
+(defun searxng-container-sections ()
   "Cinix AST for find.container. HAProxy backend: 10.89.2.1:8080."
   `(("Unit" . (("Description" . "SearXNG metasearch engine")))
     ("Container" . (("Image"         . "oci.dapla.net/searxng/searxng:latest")
                     ("ContainerName" . "searxng")
                     ("AutoUpdate"    . "registry")
                       ("Environment" . "SEARXNG_BASE_URL=https://find.dapla.net/")
-                    ("Volume" . ,(format nil "~A:/etc/searxng:Z" data-mountpoint))
+                    ("Volume" . "%h:/var/lib/searxng:ro")
+                    ("Volume" . "/srv/%U:/etc/%I:Z")
                     ("Network"       . "find.network")
                     ("Label"         . "io.containers.autoupdate=registry")
                     ("Label"         . "org.cispec.application=find-dapla-deploy")
@@ -164,7 +167,7 @@ backend find_be
   server searxng 10.89.2.1:8080 check inter 10s rise 2 fall 3
 "))
 
-(defprop quadlets-written :posix (user home data-mountpoint)
+(defprop quadlets-written :posix (user home)
   "Write all find quadlet unit files into USER's systemd container directory."
   (:desc (format nil "SearXNG metasearch engine quadlet units written for ~A" user))
   (:apply
@@ -173,7 +176,7 @@ backend find_be
      (write-remote-file (format nil "~A/find.network" quadlet-dir)
                         (cinix-write-string (searxng-network-sections)))
      (write-remote-file (format nil "~A/find.container" quadlet-dir)
-                        (cinix-write-string (searxng-container-sections data-mountpoint))))))
+                        (cinix-write-string (searxng-container-sections))))))
 
 (defprop quadlets-activated :posix (user)
   "Reload USER's user-scope systemd daemon and restart find services."
@@ -205,7 +208,7 @@ backend find_be
   (lingering-enabled *service-user*)
   (images-pulled *service-user*
                  "oci.dapla.net/searxng/searxng:latest")
-  (quadlets-written *service-user* *users-searxng-mountpoint* *containers-searxng-mountpoint*)
+  (quadlets-written *service-user* *users-searxng-mountpoint*)
   (quadlets-activated *service-user*)
   (haproxy-vhost-written))
 
